@@ -3,13 +3,41 @@ import asyncio
 import threading
 import unittest
 from pathlib import Path
-from unittest.mock import patch, AsyncMock
+from unittest.mock import patch, AsyncMock, MagicMock
 
 import numpy as np
 import audio_engine as engine
 
 
 class EngineTests(unittest.TestCase):
+    def test_monitor_resamples_each_device_and_keeps_duration(self):
+        source = np.column_stack([np.full(36000, 0.4), np.full(36000, 0.2)])
+        outputs = [MagicMock(), MagicMock()]
+        for output in outputs:
+            output.__enter__.return_value = output
+        def device(index, kind):
+            return {'default_samplerate': 48000 if index == 17 else 44100, 'max_output_channels': 2}
+        with patch.object(engine.sd, 'query_devices', side_effect=device), patch.object(engine.sd, 'OutputStream', side_effect=outputs) as streams:
+            engine.play(source, 24000, 17, 0.5, threading.Event(), monitor_index=22)
+        self.assertEqual([call.kwargs['device'] for call in streams.call_args_list], [17, 22])
+        for output, frames in zip(outputs, [72000, 66150]):
+            data = np.concatenate([call.args[0] for call in output.write.call_args_list])
+            self.assertEqual(data.shape, (frames, 2))
+            np.testing.assert_allclose(data[:, 0], 0.2)
+            np.testing.assert_allclose(data[:, 1], 0.1)
+
+    def test_stop_aborts_primary_and_monitor(self):
+        stop = threading.Event()
+        outputs = [MagicMock(), MagicMock()]
+        for output in outputs:
+            output.__enter__.return_value = output
+        outputs[1].write.side_effect = lambda _: stop.set()
+        with patch.object(engine.sd, 'query_devices', return_value={'default_samplerate': 48000, 'max_output_channels': 2}), patch.object(engine.sd, 'OutputStream', side_effect=outputs):
+            with self.assertRaises(engine.Cancelled):
+                engine.play(np.zeros((24000, 1)), 24000, 17, 1, stop, monitor_index=22)
+        for output in outputs:
+            output.abort.assert_called_once()
+
     def test_music_mp3_stereo_resampling_and_progress(self):
         with tempfile.TemporaryDirectory() as folder:
             path = Path(folder) / '音樂.mp3'

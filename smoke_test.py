@@ -1,5 +1,6 @@
 """Integration check: real network synthesis, silent device output, UI geometry."""
 import json
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 import tempfile
 import threading
@@ -45,8 +46,9 @@ def run():
     root.deiconify()
     root.update()
     assert app.text.winfo_height() >= 80
-    for widget in app.status, app.export, app.send, app.play_music_button, app.choose_music_button:
+    for widget in app.status, app.export, app.send, app.play_music_button, app.choose_music_button, app.repeat_check, app.monitor_output:
         assert widget.winfo_rooty() + widget.winfo_height() <= root.winfo_rooty() + root.winfo_height()
+        assert widget.winfo_rootx() + widget.winfo_width() <= root.winfo_rootx() + root.winfo_width()
     app.playlist = ['first.mp3', 'second.mp3']
     app.refresh_playlist()
     app.set_busy(True)
@@ -56,6 +58,7 @@ def run():
     assert str(app.play_music_button['state']) == 'normal'
     app.music_busy = True
     app.update_controls()
+    assert str(app.monitor_output['state']) == 'disabled'
     assert str(app.send['state']) == 'normal'
     assert str(app.output['state']) == 'disabled'
     app.set_busy(True)
@@ -79,6 +82,21 @@ def run():
         speech_stream.write(silence)
     report['simultaneous_output'] = 'two active shared-device streams verified with silence'
     report['simultaneous_device'] = mix_route['label']
+    monitor_route = next((d for d in available if 'cable' not in d['name'].lower()
+                          and d['index'] != mix_route['index']), None)
+    if monitor_route:
+        with tempfile.TemporaryDirectory() as folder:
+            music = Path(folder) / 'monitor.mp3'
+            engine.sf.write(music, np.zeros((12000, 2)), 24000, format='MP3')
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                speech = pool.submit(engine.play, np.zeros((12000, 1)), 24000,
+                                     mix_route['index'], 0, threading.Event(), monitor_route['index'])
+                music_job = pool.submit(engine.play_file, music, mix_route['index'], 0,
+                                        threading.Event(), None, monitor_route['index'])
+                speech.result(timeout=15)
+                music_job.result(timeout=15)
+        report['monitoring'] = 'speech and MP3 sent concurrently to primary + monitor at zero volume'
+        report['monitor_device'] = monitor_route['label']
     report['ui'] = 'loaded; controls fit; Windows voices discovered'
     report['virtual_cable_detected'] = any('cable input' in d['name'].lower() for d in available)
     root.destroy()

@@ -1,5 +1,6 @@
 """Speech synthesis and explicit-device audio playback. No UI dependencies."""
 import asyncio
+from contextlib import contextmanager, ExitStack
 import base64
 import json
 import os
@@ -160,46 +161,65 @@ def convert_audio(audio, source_rate, target_rate, channels, volume):
     return np.ascontiguousarray(audio * volume, dtype='float32')
 
 
-def play_file(path, device_index, volume, cancel, progress=None):
+@contextmanager
+def output_routes(device_index, monitor_index=None):
+    """Open primary and optional local-monitor outputs; never use default audio."""
+    indices = [device_index]
+    if monitor_index is not None and monitor_index != device_index:
+        indices.append(monitor_index)
+    with ExitStack() as stack:
+        routes = []
+        for index in indices:
+            device = sd.query_devices(index, 'output')
+            rate = int(device['default_samplerate'])
+            channels = min(2, int(device['max_output_channels']))
+            stream = stack.enter_context(sd.OutputStream(device=index, samplerate=rate,
+                                         channels=channels, dtype='float32', latency='low'))
+            routes.append((stream, rate, channels))
+        yield routes
+
+
+def write_routes(audio, sample_rate, volume, cancel, routes):
+    # Process at most a second at a time. Slice both device rates at the same
+    # 20 ms time boundaries so monitoring does not lag a whole audio block.
+    converted = [(stream, rate, convert_audio(audio, sample_rate, rate, channels, volume))
+                 for stream, rate, channels in routes]
+    steps = int(np.ceil(len(audio) * 50 / sample_rate))
+    for step in range(steps):
+        if cancel.is_set():
+            for stream, _, _ in routes:
+                stream.abort()
+            raise Cancelled()
+        for stream, rate, data in converted:
+            block = data[round(step * rate / 50):round((step + 1) * rate / 50)]
+            if len(block):
+                stream.write(block)
+
+
+def play_file(path, device_index, volume, cancel, progress=None, monitor_index=None):
     """Decode in bounded chunks; keep stereo and use only the selected output."""
     if cancel.is_set():
         raise Cancelled()
     with sf.SoundFile(path) as source:
         if source.frames == 0:
             raise ValueError('音樂檔沒有可播放的音訊。')
-        device = sd.query_devices(device_index, 'output')
-        rate = int(device['default_samplerate'])
-        channels = min(2, int(device['max_output_channels']))
-        with sd.OutputStream(device=device_index, samplerate=rate, channels=channels,
-                             dtype='float32', latency='low') as stream:
+        with output_routes(device_index, monitor_index) as routes:
             while True:
                 if cancel.is_set():
-                    stream.abort()
+                    for stream, _, _ in routes:
+                        stream.abort()
                     raise Cancelled()
                 audio = source.read(source.samplerate, dtype='float32', always_2d=True)
                 if not len(audio):
                     break
-                converted = convert_audio(audio, source.samplerate, rate, channels, volume)
-                for start in range(0, len(converted), 1024):
-                    if cancel.is_set():
-                        stream.abort()
-                        raise Cancelled()
-                    stream.write(converted[start:start + 1024])
+                write_routes(audio, source.samplerate, volume, cancel, routes)
                 if progress:
                     progress(source.tell() / source.samplerate, source.frames / source.samplerate)
 
 
-def play(audio, sample_rate, device_index, volume, cancel):
+def play(audio, sample_rate, device_index, volume, cancel, monitor_index=None):
     if cancel.is_set():
         raise Cancelled()
-    device = sd.query_devices(device_index, 'output')
-    rate = int(device['default_samplerate'])
-    channels = min(2, int(device['max_output_channels']))
-    converted = convert_audio(audio, sample_rate, rate, channels, volume)
-    with sd.OutputStream(device=device_index, samplerate=rate, channels=channels,
-                         dtype='float32', latency='low') as stream:
-        for start in range(0, len(converted), 1024):
-            if cancel.is_set():
-                stream.abort()
-                raise Cancelled()
-            stream.write(converted[start:start + 1024])
+    with output_routes(device_index, monitor_index) as routes:
+        for start in range(0, len(audio), sample_rate):
+            write_routes(audio[start:start + sample_rate], sample_rate, volume, cancel, routes)

@@ -65,6 +65,7 @@ class App:
         self.voice_map = {name: (code, False) for name, code in ONLINE.items()}
         self.device_map = {}
         self.settings = self.load_settings()
+        self.repeat_event = threading.Event()
         root.title('VoiceBridge｜文字語音麥克風')
         root.geometry('850x760')
         root.minsize(760, 700)
@@ -96,6 +97,15 @@ class App:
         self.refresh_button.pack(side='right', padx=(8, 0))
         self.route = ttk.Label(body, text='', wraplength=770)
         self.route.pack(anchor='w', pady=(6, 10))
+        monitor_row = ttk.Frame(body)
+        monitor_row.pack(fill='x', pady=(0, 8))
+        self.monitor_enabled = tk.BooleanVar(value=self.settings.get('monitor_enabled', False) is True)
+        self.monitor_check = ttk.Checkbutton(monitor_row, text='監聽（選耳機／喇叭）',
+                                            variable=self.monitor_enabled, command=self.save_settings)
+        self.monitor_check.pack(side='left')
+        self.monitor_output = ttk.Combobox(monitor_row, state='readonly')
+        self.monitor_output.pack(side='left', fill='x', expand=True, padx=(8, 0))
+        self.monitor_output.bind('<<ComboboxSelected>>', lambda _: self.save_settings())
         controls = ttk.Frame(body)
         controls.pack(fill='x')
         ttk.Label(controls, text='語速 %').pack(side='left')
@@ -147,6 +157,12 @@ class App:
         self.next_button.pack(side='left', padx=8)
         self.remove_button = ttk.Button(music, text='移除選取', command=self.remove_music)
         self.remove_button.pack(side='left')
+        self.repeat = tk.BooleanVar(value=self.settings.get('repeat', False) is True)
+        if self.repeat.get():
+            self.repeat_event.set()
+        self.repeat_check = ttk.Checkbutton(music, text='清單循環', variable=self.repeat,
+                                           command=self.change_repeat)
+        self.repeat_check.pack(side='left', padx=(8, 0))
         self.music_status = ttk.Label(body, text='可一次加入多首音樂，依序播放；播放中仍可送出語音。Esc 停止全部。', wraplength=760)
         self.music_status.pack(anchor='w', pady=(0, 6))
         self.progress = ttk.Progressbar(body, mode='indeterminate')
@@ -179,7 +195,10 @@ class App:
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
             CONFIG.write_text(json.dumps({'voice': self.voice.get(), 'device': self.output.get(),
                                            'rate': self.rate.get(), 'volume': self.volume.get(),
-                                           'music_volume': self.music_volume.get()}, ensure_ascii=False), encoding='utf-8')
+                                           'music_volume': self.music_volume.get(),
+                                           'repeat': self.repeat.get(),
+                                           'monitor_enabled': self.monitor_enabled.get(),
+                                           'monitor_device': self.monitor_output.get()}, ensure_ascii=False), encoding='utf-8')
         except (OSError, tk.TclError):
             pass
 
@@ -189,6 +208,10 @@ class App:
             available = devices()
             self.device_map = {d['label']: d['index'] for d in available}
             self.output.configure(values=list(self.device_map))
+            current_monitor = self.monitor_output.get() or self.settings.get('monitor_device')
+            monitor_labels = [d['label'] for d in available if 'cable' not in d['name'].lower()]
+            self.monitor_output.configure(values=monitor_labels)
+            self.monitor_output.set(current_monitor if current_monitor in monitor_labels else '')
             cables = [d['label'] for d in available if 'cable input' in d['name'].lower()]
             # Never choose a physical speaker implicitly.
             self.output.set(current if current in self.device_map else (cables[0] if cables else ''))
@@ -201,6 +224,23 @@ class App:
             self.events.put(('voices', offline_voices()))
         except Exception as error:
             self.events.put(('voice_error', str(error)))
+
+    def change_repeat(self):
+        if self.repeat.get():
+            self.repeat_event.set()
+        else:
+            self.repeat_event.clear()
+        self.save_settings()
+
+    def get_monitor_index(self):
+        if not self.monitor_enabled.get():
+            return None
+        label = self.monitor_output.get()
+        if label not in self.device_map:
+            raise ValueError('請先選擇監聽耳機／喇叭，或取消勾選監聽。')
+        if label.split('  [')[0] == self.output.get().split('  [')[0]:
+            raise ValueError('監聽裝置請選不同於主要輸出的耳機／喇叭。')
+        return self.device_map[label]
 
     def start(self):
         if self.busy:
@@ -221,20 +261,25 @@ class App:
             return
         voice, offline = self.voice_map[self.voice.get()]
         device = self.device_map[self.output.get()]
+        try:
+            monitor = self.get_monitor_index()
+        except ValueError as error:
+            messagebox.showinfo('監聽設定', str(error))
+            return
         self.save_settings()
         self.cancel = threading.Event()
         self.set_busy(True)
         self.status.configure(text='正在產生語音…')
-        threading.Thread(target=self.worker, args=(text, voice, offline, rate, volume / 100, device, self.cancel), daemon=True).start()
+        threading.Thread(target=self.worker, args=(text, voice, offline, rate, volume / 100, device, self.cancel, monitor), daemon=True).start()
 
-    def worker(self, text, voice, offline, rate, volume, device, cancel):
+    def worker(self, text, voice, offline, rate, volume, device, cancel, monitor=None):
         try:
             with tempfile.TemporaryDirectory(prefix='VoiceBridge-') as folder:
                 path = Path(folder) / ('speech.wav' if offline else 'speech.mp3')
                 audio, sample_rate = synthesize(text, voice, rate, path, cancel, offline)
             self.events.put(('audio', (audio, sample_rate)))
             self.events.put(('status', '正在輸出語音…'))
-            play(audio, sample_rate, device, volume, cancel)
+            play(audio, sample_rate, device, volume, cancel, monitor_index=monitor)
             self.events.put(('done', '語音已輸出完成。'))
         except Cancelled:
             self.events.put(('done', '已停止。'))
@@ -277,6 +322,11 @@ class App:
         except (ValueError, tk.TclError):
             messagebox.showinfo('音量範圍', '音量須為 0～100 的整數。')
             return
+        try:
+            monitor = self.get_monitor_index()
+        except ValueError as error:
+            messagebox.showinfo('監聽設定', str(error))
+            return
         self.save_settings()
         self.music_cancel = threading.Event()
         self.track_cancel = threading.Event()
@@ -284,14 +334,18 @@ class App:
         self.update_controls()
         self.music_status.configure(text='正在開啟播放清單…')
         threading.Thread(target=self.music_worker,
-                         args=(list(self.playlist), self.device_map[self.output.get()], volume / 100, self.music_cancel),
+                         args=(list(self.playlist), self.device_map[self.output.get()], volume / 100,
+                               self.music_cancel, self.repeat_event, monitor),
                          daemon=True).start()
 
-    def music_worker(self, playlist, device, volume, cancel):
-        failures = []
-        for index, path in enumerate(playlist):
+    def music_worker(self, playlist, device, volume, cancel, repeat=None, monitor=None):
+        failures = {}
+        index = 0
+        playable = False
+        while playlist:
             if cancel.is_set():
                 break
+            path = playlist[index]
             track_cancel = self.track_cancel
             title = f'{index + 1}/{len(playlist)} {Path(path).name}'
             self.events.put(('music_track', index))
@@ -301,17 +355,26 @@ class App:
                     return f'{int(seconds) // 60:02d}:{int(seconds) % 60:02d}'
                 self.events.put(('music_status', f'{title}  {timestamp(elapsed)} / {timestamp(duration)}'))
             try:
-                play_file(path, device, volume, track_cancel, progress)
+                play_file(path, device, volume, track_cancel, progress, monitor_index=monitor)
+                playable = True
+                failures.pop(index, None)
             except Cancelled:
-                pass
+                playable = True
             except Exception as error:
-                failures.append(f'{Path(path).name}: {error}')
+                failures[index] = f'{Path(path).name}: {error}'
             finally:
                 self.track_cancel = threading.Event()
+            index += 1
+            if index == len(playlist):
+                # Stop if every file failed; avoid endlessly retrying a bad list.
+                if repeat is None or not repeat.is_set() or not playable:
+                    break
+                index = 0
+                playable = False
         result = '音樂已停止。' if cancel.is_set() else '播放清單已播放完成。'
         if failures:
             result += f' {len(failures)} 首失敗。'
-            self.events.put(('music_errors', '\n'.join(failures)[:1500]))
+            self.events.put(('music_errors', '\n'.join(failures.values())[:1500]))
         self.events.put(('music_done', result))
 
     def stop_music(self):
@@ -338,6 +401,8 @@ class App:
         self.next_button.configure(state='normal' if self.music_busy else 'disabled')
         self.refresh_button.configure(state='disabled' if active else 'normal')
         self.output.configure(state='disabled' if active else 'readonly')
+        self.monitor_check.configure(state='disabled' if active else 'normal')
+        self.monitor_output.configure(state='disabled' if active else 'readonly')
         self.voice.configure(state='disabled' if self.busy else 'readonly')
         self.stop_button.configure(state='normal' if self.busy else 'disabled')
         if self.busy:
