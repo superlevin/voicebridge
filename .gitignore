@@ -1,0 +1,34 @@
+# Python and local environments
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build outputs and generated reports
+build/
+dist/
+*.spec
+*.log
+*verification.json
+
+# Local configuration, credentials, audio and third-party installers
+.env
+.env.*
+!.env.example
+settings.json
+drivers/
+*.exe
+*.dll
+*.zip
+*.mp3
+*.wav
+
+# Editor/OS files
+.idea/
+.vscode/
+Thumbs.db
+.DS_Store
