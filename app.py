@@ -57,8 +57,11 @@ class App:
         self.events = queue.Queue()
         self.cancel = threading.Event()
         self.busy = False
+        self.music_busy = False
+        self.music_cancel = threading.Event()
+        self.track_cancel = threading.Event()
+        self.playlist = []
         self.last_audio = None
-        self.music_path = None
         self.voice_map = {name: (code, False) for name, code in ONLINE.items()}
         self.device_map = {}
         self.settings = self.load_settings()
@@ -98,12 +101,24 @@ class App:
         ttk.Label(controls, text='語速 %').pack(side='left')
         self.rate = tk.IntVar(value=self.setting_number('rate', 0, -50, 100))
         ttk.Spinbox(controls, from_=-50, to=100, textvariable=self.rate, width=6).pack(side='left', padx=(8, 22))
-        ttk.Label(controls, text='音量 %').pack(side='left')
+        ttk.Label(controls, text='語音音量 %').pack(side='left')
         self.volume = tk.IntVar(value=self.setting_number('volume', 80, 0, 100))
         ttk.Spinbox(controls, from_=0, to=100, textvariable=self.volume, width=6).pack(side='left', padx=8)
-        ttk.Label(body, text='想說的話（最多 2,000 字）').pack(anchor='w', pady=(14, 5))
-        text_frame = ttk.Frame(body)
-        text_frame.pack(fill='both', expand=True)
+        ttk.Label(controls, text='音樂音量 %').pack(side='left', padx=(16, 0))
+        self.music_volume = tk.IntVar(value=self.setting_number('music_volume', 30, 0, 100))
+        ttk.Spinbox(controls, from_=0, to=100, textvariable=self.music_volume, width=6).pack(side='left', padx=8)
+        self.tabs = ttk.Notebook(body)
+        self.tabs.pack(fill='both', expand=True, pady=(12, 0))
+        text_frame = ttk.Frame(self.tabs)
+        self.tabs.add(text_frame, text='文字語音（最多 2,000 字）')
+        music_frame = ttk.Frame(self.tabs)
+        self.tabs.add(music_frame, text='音樂播放清單')
+        self.playlist_box = tk.Listbox(music_frame, selectmode='extended', exportselection=False,
+                                      font=('Microsoft JhengHei UI', 12), height=7)
+        self.playlist_box.pack(side='left', fill='both', expand=True)
+        playlist_scroll = ttk.Scrollbar(music_frame, command=self.playlist_box.yview)
+        playlist_scroll.pack(side='right', fill='y')
+        self.playlist_box.configure(yscrollcommand=playlist_scroll.set)
         self.text = tk.Text(text_frame, wrap='word', font=('Microsoft JhengHei UI', 14),
                             height=7, relief='flat', padx=14, pady=12, undo=True)
         self.text.pack(side='left', fill='both', expand=True)
@@ -111,23 +126,29 @@ class App:
         scrollbar.pack(side='right', fill='y')
         self.text.configure(yscrollcommand=scrollbar.set)
         self.text.insert('1.0', DEFAULT_TEXT)
-        self.text.bind('<Control-Return>', lambda _: self.start())
+        root.bind('<Control-Return>', lambda _: self.start())
         buttons = ttk.Frame(body)
         buttons.pack(fill='x', pady=12)
         self.send = ttk.Button(buttons, text='▶  送出語音  Ctrl+Enter', style='Accent.TButton', command=self.start)
         self.send.pack(side='left')
-        self.stop_button = ttk.Button(buttons, text='■  停止  Esc', command=self.stop, state='disabled')
+        self.stop_button = ttk.Button(buttons, text='■ 停止語音', command=self.stop_speech, state='disabled')
         self.stop_button.pack(side='left', padx=8)
         self.export = ttk.Button(buttons, text='儲存上一段 WAV', command=self.save_audio, state='disabled')
         self.export.pack(side='right')
         music = ttk.Frame(body)
         music.pack(fill='x', pady=(0, 10))
-        self.choose_music_button = ttk.Button(music, text='選擇 MP3 音樂', command=self.choose_music)
+        self.choose_music_button = ttk.Button(music, text='加入多首 MP3', command=self.choose_music)
         self.choose_music_button.pack(side='left')
         self.play_music_button = ttk.Button(music, text='▶ 播放音樂', command=self.start_music, state='disabled')
         self.play_music_button.pack(side='left', padx=8)
-        self.music_label = ttk.Label(music, text='尚未選擇檔案', width=33)
-        self.music_label.pack(side='left', fill='x', expand=True)
+        self.music_stop_button = ttk.Button(music, text='■ 停止音樂', command=self.stop_music, state='disabled')
+        self.music_stop_button.pack(side='left')
+        self.next_button = ttk.Button(music, text='下一首', command=self.next_track, state='disabled')
+        self.next_button.pack(side='left', padx=8)
+        self.remove_button = ttk.Button(music, text='移除選取', command=self.remove_music)
+        self.remove_button.pack(side='left')
+        self.music_status = ttk.Label(body, text='可一次加入多首音樂，依序播放；播放中仍可送出語音。Esc 停止全部。', wraplength=760)
+        self.music_status.pack(anchor='w', pady=(0, 6))
         self.progress = ttk.Progressbar(body, mode='indeterminate')
         self.progress.pack(fill='x')
         self.status = ttk.Label(body, text='正在載入音訊裝置與離線音色…', wraplength=760)
@@ -157,7 +178,8 @@ class App:
         try:
             CONFIG.parent.mkdir(parents=True, exist_ok=True)
             CONFIG.write_text(json.dumps({'voice': self.voice.get(), 'device': self.output.get(),
-                                           'rate': self.rate.get(), 'volume': self.volume.get()}, ensure_ascii=False), encoding='utf-8')
+                                           'rate': self.rate.get(), 'volume': self.volume.get(),
+                                           'music_volume': self.music_volume.get()}, ensure_ascii=False), encoding='utf-8')
         except (OSError, tk.TclError):
             pass
 
@@ -220,60 +242,105 @@ class App:
             self.events.put(('error', f'{error}\n\n線上音色失敗時可改用 Windows 離線音色。裝置錯誤時請重新整理並重選輸出。'))
 
     def choose_music(self):
-        if self.busy:
+        if self.music_busy:
             return
-        path = filedialog.askopenfilename(title='選擇要播放的音樂',
-                                         filetypes=[('MP3 音樂', '*.mp3'), ('WAV 音訊', '*.wav')])
-        if path:
-            self.music_path = path
-            name = Path(path).name
-            self.music_label.configure(text=name if len(name) <= 32 else name[:29] + '…')
-            self.play_music_button.configure(state='normal')
+        paths = filedialog.askopenfilenames(title='加入音樂（可用 Ctrl / Shift 多選）',
+                                           filetypes=[('音樂檔', '*.mp3 *.wav')])
+        if paths:
+            self.playlist.extend(paths)
+            self.refresh_playlist()
+            self.tabs.select(1)
+
+    def refresh_playlist(self):
+        self.playlist_box.delete(0, 'end')
+        for index, path in enumerate(self.playlist):
+            self.playlist_box.insert('end', f'{index + 1}. {Path(path).name}')
+        self.update_controls()
+
+    def remove_music(self):
+        if self.music_busy:
+            return
+        for index in reversed(self.playlist_box.curselection()):
+            del self.playlist[index]
+        self.refresh_playlist()
 
     def start_music(self):
-        if self.busy or not self.music_path:
+        if self.music_busy or not self.playlist:
             return
         if self.output.get() not in self.device_map:
             messagebox.showinfo('選擇輸出', '請先選擇音訊輸出裝置。')
             return
         try:
-            volume = self.volume.get()
+            volume = self.music_volume.get()
             if not 0 <= volume <= 100:
                 raise ValueError()
         except (ValueError, tk.TclError):
             messagebox.showinfo('音量範圍', '音量須為 0～100 的整數。')
             return
         self.save_settings()
-        self.cancel = threading.Event()
-        self.set_busy(True)
-        self.status.configure(text='正在開啟音樂…')
+        self.music_cancel = threading.Event()
+        self.track_cancel = threading.Event()
+        self.music_busy = True
+        self.update_controls()
+        self.music_status.configure(text='正在開啟播放清單…')
         threading.Thread(target=self.music_worker,
-                         args=(self.music_path, self.device_map[self.output.get()], volume / 100, self.cancel),
+                         args=(list(self.playlist), self.device_map[self.output.get()], volume / 100, self.music_cancel),
                          daemon=True).start()
 
-    def music_worker(self, path, device, volume, cancel):
-        def progress(elapsed, duration):
-            def timestamp(seconds):
-                return f'{int(seconds) // 60:02d}:{int(seconds) % 60:02d}'
-            self.events.put(('status', f'音樂播放中  {timestamp(elapsed)} / {timestamp(duration)}'))
-        try:
-            play_file(path, device, volume, cancel, progress)
-            self.events.put(('done', '音樂播放完成。'))
-        except Cancelled:
-            self.events.put(('done', '音樂已停止。'))
-        except Exception as error:
-            self.events.put(('error', f'無法播放音樂：{error}\n請確認檔案可讀取且為有效的 MP3／WAV，並檢查輸出裝置。'))
+    def music_worker(self, playlist, device, volume, cancel):
+        failures = []
+        for index, path in enumerate(playlist):
+            if cancel.is_set():
+                break
+            track_cancel = self.track_cancel
+            title = f'{index + 1}/{len(playlist)} {Path(path).name}'
+            self.events.put(('music_track', index))
+            self.events.put(('music_status', f'正在播放 {title}'))
+            def progress(elapsed, duration, title=title):
+                def timestamp(seconds):
+                    return f'{int(seconds) // 60:02d}:{int(seconds) % 60:02d}'
+                self.events.put(('music_status', f'{title}  {timestamp(elapsed)} / {timestamp(duration)}'))
+            try:
+                play_file(path, device, volume, track_cancel, progress)
+            except Cancelled:
+                pass
+            except Exception as error:
+                failures.append(f'{Path(path).name}: {error}')
+            finally:
+                self.track_cancel = threading.Event()
+        result = '音樂已停止。' if cancel.is_set() else '播放清單已播放完成。'
+        if failures:
+            result += f' {len(failures)} 首失敗。'
+            self.events.put(('music_errors', '\n'.join(failures)[:1500]))
+        self.events.put(('music_done', result))
+
+    def stop_music(self):
+        if self.music_busy:
+            self.music_cancel.set()
+            self.track_cancel.set()
+            self.music_status.configure(text='正在停止音樂…')
+
+    def next_track(self):
+        if self.music_busy:
+            self.track_cancel.set()
 
     def set_busy(self, busy):
         self.busy = busy
-        self.send.configure(state='disabled' if busy else 'normal')
-        self.choose_music_button.configure(state='disabled' if busy else 'normal')
-        self.play_music_button.configure(state='normal' if not busy and self.music_path else 'disabled')
-        self.refresh_button.configure(state='disabled' if busy else 'normal')
-        self.output.configure(state='disabled' if busy else 'readonly')
-        self.voice.configure(state='disabled' if busy else 'readonly')
-        self.stop_button.configure(state='normal' if busy else 'disabled')
-        if busy:
+        self.update_controls()
+
+    def update_controls(self):
+        active = self.busy or self.music_busy
+        self.send.configure(state='disabled' if self.busy else 'normal')
+        self.choose_music_button.configure(state='disabled' if self.music_busy else 'normal')
+        self.remove_button.configure(state='disabled' if self.music_busy else 'normal')
+        self.play_music_button.configure(state='normal' if not self.music_busy and self.playlist else 'disabled')
+        self.music_stop_button.configure(state='normal' if self.music_busy else 'disabled')
+        self.next_button.configure(state='normal' if self.music_busy else 'disabled')
+        self.refresh_button.configure(state='disabled' if active else 'normal')
+        self.output.configure(state='disabled' if active else 'readonly')
+        self.voice.configure(state='disabled' if self.busy else 'readonly')
+        self.stop_button.configure(state='normal' if self.busy else 'disabled')
+        if self.busy:
             self.progress.start(12)
         else:
             self.progress.stop()
@@ -300,6 +367,18 @@ class App:
                     self.export.configure(state='normal')
                 elif kind == 'status':
                     self.status.configure(text=value)
+                elif kind == 'music_status':
+                    self.music_status.configure(text=value)
+                elif kind == 'music_track':
+                    self.playlist_box.selection_clear(0, 'end')
+                    self.playlist_box.selection_set(value)
+                    self.playlist_box.see(value)
+                elif kind == 'music_done':
+                    self.music_busy = False
+                    self.update_controls()
+                    self.music_status.configure(text=value)
+                elif kind == 'music_errors':
+                    messagebox.showerror('部分音樂無法播放', value)
                 elif kind in ('done', 'error'):
                     self.set_busy(False)
                     self.status.configure(text=value if kind == 'done' else '輸出失敗，請查看錯誤訊息。')
@@ -309,10 +388,14 @@ class App:
             pass
         self.root.after(80, self.poll)
 
-    def stop(self):
+    def stop_speech(self):
         if self.busy:
             self.cancel.set()
             self.status.configure(text='正在停止…')
+
+    def stop(self):
+        self.stop_speech()
+        self.stop_music()
 
     def save_audio(self):
         if self.last_audio is None:
@@ -325,13 +408,13 @@ class App:
                 messagebox.showerror('儲存失敗', str(error))
 
     def close(self):
-        self.cancel.set()
+        self.stop()
         self.save_settings()
         self.root.withdraw()
         self.wait_close()
 
     def wait_close(self):
-        if self.busy:
+        if self.busy or self.music_busy:
             self.root.after(100, self.wait_close)
         else:
             self.root.destroy()

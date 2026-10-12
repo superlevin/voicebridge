@@ -47,12 +47,38 @@ def run():
     assert app.text.winfo_height() >= 80
     for widget in app.status, app.export, app.send, app.play_music_button, app.choose_music_button:
         assert widget.winfo_rooty() + widget.winfo_height() <= root.winfo_rooty() + root.winfo_height()
-    app.music_path = 'selected.mp3'
+    app.playlist = ['first.mp3', 'second.mp3']
+    app.refresh_playlist()
     app.set_busy(True)
-    assert str(app.play_music_button['state']) == 'disabled'
+    assert str(app.play_music_button['state']) == 'normal'
     assert str(app.send['state']) == 'disabled'
     app.set_busy(False)
     assert str(app.play_music_button['state']) == 'normal'
+    app.music_busy = True
+    app.update_controls()
+    assert str(app.send['state']) == 'normal'
+    assert str(app.output['state']) == 'disabled'
+    app.set_busy(True)
+    app.events.put(('done', 'Speech finished'))
+    app.poll()
+    assert app.music_busy and not app.busy
+    assert str(app.output['state']) == 'disabled'
+    app.events.put(('music_done', 'Music finished'))
+    app.poll()
+    assert not app.music_busy
+    report['playlist_ui'] = 'two tracks; speech/music independent; output locked while either plays'
+    # Confirm Windows shared-mode opens two simultaneous streams on the route.
+    mix_route = next((d for d in available if 'cable input' in d['name'].lower()), available[0])
+    device = engine.sd.query_devices(mix_route['index'], 'output')
+    settings = dict(device=mix_route['index'], samplerate=int(device['default_samplerate']),
+                    channels=min(2, device['max_output_channels']), dtype='float32')
+    with engine.sd.OutputStream(**settings) as music_stream, engine.sd.OutputStream(**settings) as speech_stream:
+        silence = np.zeros((1024, settings['channels']), dtype='float32')
+        assert music_stream.active and speech_stream.active
+        music_stream.write(silence)
+        speech_stream.write(silence)
+    report['simultaneous_output'] = 'two active shared-device streams verified with silence'
+    report['simultaneous_device'] = mix_route['label']
     report['ui'] = 'loaded; controls fit; Windows voices discovered'
     report['virtual_cable_detected'] = any('cable input' in d['name'].lower() for d in available)
     root.destroy()
