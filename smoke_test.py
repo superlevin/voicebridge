@@ -1,6 +1,7 @@
 """Integration check: real network synthesis, silent device output, UI geometry."""
 import json
 from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 from pathlib import Path
 import tempfile
 import threading
@@ -70,17 +71,8 @@ def run():
     app.poll()
     assert not app.music_busy
     report['playlist_ui'] = 'two tracks; speech/music independent; output locked while either plays'
-    # Confirm Windows shared-mode opens two simultaneous streams on the route.
+    # Exercise the application's shared mixer, not independent silent streams.
     mix_route = next((d for d in available if 'cable input' in d['name'].lower()), available[0])
-    device = engine.sd.query_devices(mix_route['index'], 'output')
-    settings = dict(device=mix_route['index'], samplerate=int(device['default_samplerate']),
-                    channels=min(2, device['max_output_channels']), dtype='float32')
-    with engine.sd.OutputStream(**settings) as music_stream, engine.sd.OutputStream(**settings) as speech_stream:
-        silence = np.zeros((1024, settings['channels']), dtype='float32')
-        assert music_stream.active and speech_stream.active
-        music_stream.write(silence)
-        speech_stream.write(silence)
-    report['simultaneous_output'] = 'two active shared-device streams verified with silence'
     report['simultaneous_device'] = mix_route['label']
     monitor_route = next((d for d in available if 'cable' not in d['name'].lower()
                           and d['index'] != mix_route['index']), None)
@@ -88,14 +80,16 @@ def run():
         with tempfile.TemporaryDirectory() as folder:
             music = Path(folder) / 'monitor.mp3'
             engine.sf.write(music, np.zeros((12000, 2)), 24000, format='MP3')
-            with ThreadPoolExecutor(max_workers=2) as pool:
-                speech = pool.submit(engine.play, np.zeros((12000, 1)), 24000,
-                                     mix_route['index'], 0, threading.Event(), monitor_route['index'])
-                music_job = pool.submit(engine.play_file, music, mix_route['index'], 0,
-                                        threading.Event(), None, monitor_route['index'])
-                speech.result(timeout=15)
-                music_job.result(timeout=15)
-        report['monitoring'] = 'speech and MP3 sent concurrently to primary + monitor at zero volume'
+            with patch.object(engine.sd, 'OutputStream', wraps=engine.sd.OutputStream) as output_factory:
+                with ThreadPoolExecutor(max_workers=2) as pool:
+                    speech = pool.submit(engine.play, np.zeros((12000, 1)), 24000,
+                                         mix_route['index'], 0, threading.Event(), monitor_route['index'])
+                    music_job = pool.submit(engine.play_file, music, mix_route['index'], 0,
+                                            threading.Event(), None, monitor_route['index'])
+                    speech.result(timeout=15)
+                    music_job.result(timeout=15)
+                assert [call.kwargs['device'] for call in output_factory.call_args_list] == [mix_route['index'], monitor_route['index']]
+        report['monitoring'] = 'shared mixer: exactly one primary stream + one monitor stream; speech and MP3 concurrent at zero volume'
         report['monitor_device'] = monitor_route['label']
     report['ui'] = 'loaded; controls fit; Windows voices discovered'
     report['virtual_cable_detected'] = any('cable input' in d['name'].lower() for d in available)

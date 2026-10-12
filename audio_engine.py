@@ -6,6 +6,7 @@ import json
 import os
 from pathlib import Path
 import subprocess
+import threading
 import time
 
 import edge_tts
@@ -196,30 +197,149 @@ def write_routes(audio, sample_rate, volume, cancel, routes):
                 stream.write(block)
 
 
+MIX_RATE = 48000
+MIX_FRAMES = 960  # 20 ms; one shared timeline for speech and music.
+
+
+def audio_blocks(chunks, sample_rate, volume):
+    """Convert bounded, one-second source chunks into stereo mixer blocks."""
+    for chunk in chunks:
+        converted = convert_audio(chunk, sample_rate, MIX_RATE, 2, volume)
+        for start in range(0, len(converted), MIX_FRAMES):
+            yield converted[start:start + MIX_FRAMES]
+
+
+def mix_blocks(blocks):
+    mixed = np.zeros((max(len(block) for block in blocks), 2), dtype='float32')
+    for block in blocks:
+        mixed[:len(block)] += block
+    return np.clip(mixed, -1, 1)
+
+
+class MixerJob:
+    def __init__(self, blocks, cancel, progress, duration):
+        self.blocks = iter(blocks)
+        self.cancel = cancel
+        self.progress = progress
+        self.duration = duration
+        self.frames = 0
+        self.done = threading.Event()
+        self.error = None
+
+
+class AudioMixer:
+    """Single owner of output streams. Adding/stopping a lane never replaces another."""
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.jobs = []
+        self.running = False
+        self.route_key = None
+
+    def play(self, blocks, device_index, monitor_index, cancel, progress=None, duration=0):
+        if cancel.is_set():
+            raise Cancelled()
+        job = MixerJob(blocks, cancel, progress, duration)
+        key = (device_index, monitor_index)
+        with self.lock:
+            if self.running and self.route_key != key:
+                raise RuntimeError('播放中不可切換音訊輸出或監聽裝置。')
+            self.jobs.append(job)
+            if not self.running:
+                self.route_key = key
+                self.running = True
+                threading.Thread(target=self._run, args=key, daemon=True).start()
+        job.done.wait()
+        if job.error is not None:
+            raise job.error
+
+    def _finish(self, job, error=None):
+        self.jobs.remove(job)
+        job.error = error
+
+    def _run(self, device_index, monitor_index):
+        stack = ExitStack()
+        finished = []
+        try:
+            routes = stack.enter_context(output_routes(device_index, monitor_index))
+            while True:
+                # Serialize stream lifecycle with submissions so a newly submitted
+                # voice cannot get stranded during the last music block's cleanup.
+                with self.lock:
+                    blocks = []
+                    active = []
+                    finished = []
+                    for job in list(self.jobs):
+                        if job.cancel.is_set():
+                            self._finish(job, Cancelled())
+                            finished.append(job)
+                            continue
+                        try:
+                            block = next(job.blocks)
+                        except StopIteration:
+                            self._finish(job)
+                            finished.append(job)
+                            continue
+                        except Exception as error:
+                            self._finish(job, error)
+                            finished.append(job)
+                            continue
+                        blocks.append(block)
+                        active.append((job, len(block)))
+                    if not self.jobs:
+                        if any(isinstance(job.error, Cancelled) for job in finished):
+                            for stream, _, _ in routes:
+                                stream.abort()
+                        stack.close()
+                        self.running = False
+                        for job in finished:
+                            job.done.set()
+                        return
+                    for job in finished:
+                        job.done.set()
+                if blocks:
+                    # Never hold the submission lock during blocking device writes:
+                    # a newly synthesized voice must join the very next music block.
+                    write_routes(mix_blocks(blocks), MIX_RATE, 1, threading.Event(), routes)
+                    for job, count in active:
+                        previous = job.frames
+                        job.frames += count
+                        if job.progress and (previous // 9600 != job.frames // 9600
+                                             or job.frames / MIX_RATE >= job.duration):
+                            job.progress(min(job.frames / MIX_RATE, job.duration), job.duration)
+                time.sleep(0)  # Let new lane submissions acquire the lock.
+        except Exception as error:
+            with self.lock:
+                try:
+                    stack.close()
+                except Exception:
+                    pass
+                for job in list(self.jobs):
+                    self._finish(job, error)
+                    job.done.set()
+                for job in finished:
+                    job.done.set()
+                self.running = False
+
+
+_mixer = AudioMixer()
+
+
 def play_file(path, device_index, volume, cancel, progress=None, monitor_index=None):
-    """Decode in bounded chunks; keep stereo and use only the selected output."""
     if cancel.is_set():
         raise Cancelled()
     with sf.SoundFile(path) as source:
         if source.frames == 0:
             raise ValueError('音樂檔沒有可播放的音訊。')
-        with output_routes(device_index, monitor_index) as routes:
+        def chunks():
             while True:
-                if cancel.is_set():
-                    for stream, _, _ in routes:
-                        stream.abort()
-                    raise Cancelled()
-                audio = source.read(source.samplerate, dtype='float32', always_2d=True)
-                if not len(audio):
+                chunk = source.read(source.samplerate, dtype='float32', always_2d=True)
+                if not len(chunk):
                     break
-                write_routes(audio, source.samplerate, volume, cancel, routes)
-                if progress:
-                    progress(source.tell() / source.samplerate, source.frames / source.samplerate)
+                yield chunk
+        _mixer.play(audio_blocks(chunks(), source.samplerate, volume), device_index,
+                    monitor_index, cancel, progress, source.frames / source.samplerate)
 
 
 def play(audio, sample_rate, device_index, volume, cancel, monitor_index=None):
-    if cancel.is_set():
-        raise Cancelled()
-    with output_routes(device_index, monitor_index) as routes:
-        for start in range(0, len(audio), sample_rate):
-            write_routes(audio[start:start + sample_rate], sample_rate, volume, cancel, routes)
+    chunks = (audio[start:start + sample_rate] for start in range(0, len(audio), sample_rate))
+    _mixer.play(audio_blocks(chunks, sample_rate, volume), device_index, monitor_index, cancel)
